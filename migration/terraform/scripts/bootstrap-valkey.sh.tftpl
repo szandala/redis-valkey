@@ -1,0 +1,117 @@
+#!/bin/bash -eu
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update
+apt-get install -y curl wget ca-certificates tar \
+  xz-utils build-essential tcl libssl-dev \
+  pkg-config libjemalloc-dev libsystemd-dev
+
+VALKEY_VERSION="8.1.5"
+
+cd /tmp
+wget https://github.com/valkey-io/valkey/archive/refs/tags/$${VALKEY_VERSION}.tar.gz
+tar -xzf $${VALKEY_VERSION}.tar.gz
+
+cd valkey-$${VALKEY_VERSION}
+make -j$(nproc) USE_SYSTEMD=yes
+make install
+useradd -r -s /bin/false valkey || true
+mkdir -p /etc/valkey \
+  /var/lib/valkey \
+  /var/log/valkey/ \
+  /run/valkey/
+
+cat > /etc/systemd/system/valkey.service <<EOF
+[Unit]
+Description=Valkey In-Memory Data Store
+After=network.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/valkey-server /etc/valkey/valkey.conf
+Restart=always
+User=valkey
+Group=valkey
+RuntimeDirectory=valkey
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+INSTANCE_IP=$(curl -sH "Metadata-Flavor: Google" \
+  http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip)
+
+cat > /etc/valkey/valkey.conf <<EOF
+# Do no change by hand - manages by SRE and IaaC
+
+bind 0.0.0.0
+port 6379
+protected-mode yes
+requirepass ${VALKEY_PASS}
+masterauth ${VALKEY_PASS}
+
+cluster-enabled yes
+cluster-config-file /var/lib/valkey/nodes.conf
+cluster-node-timeout 15000
+cluster-announce-ip $${INSTANCE_IP}
+cluster-announce-port 6379
+cluster-announce-bus-port 16379
+cluster-announce-hostname ${DNS_NAME}
+cluster-preferred-endpoint-type hostname
+cluster-require-full-coverage no
+
+appendonly yes
+appendfilename "appendonly.aof"
+appendfsync everysec
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 256mb
+save 900 1
+save 300 10
+save 120 10000
+dir /var/lib/valkey
+
+maxmemory 24gb
+maxmemory-policy allkeys-lru
+
+# These might be needed for rollback
+# notify-keyspace-events "KEA"
+
+tcp-keepalive 60
+tcp-backlog 511
+timeout 0
+
+io-threads 4
+
+logfile /var/log/valkey/valkey-server.log
+loglevel notice
+
+daemonize no
+supervised systemd
+pidfile /run/valkey/valkey-server.pid
+
+slowlog-log-slower-than 10000
+slowlog-max-len 256
+EOF
+chmod 0640 /etc/valkey/valkey.conf
+chown -R valkey:valkey /etc/valkey /var/lib/valkey /var/log/valkey/ /run/valkey/
+
+# To shut up warnings on memory usage
+sysctl -w vm.overcommit_memory=1
+echo "vm.overcommit_memory = 1" >> /etc/sysctl.conf
+
+systemctl daemon-reload
+systemctl enable --now valkey
+systemctl status valkey
+
+for i in {1..60}; do
+  if valkey-cli -a "${VALKEY_PASS}" --no-auth-warning PING 2>/dev/null | grep -q PONG; then
+    echo "Valkey up."
+    exit 0
+  fi
+  sleep 2
+done
+
+echo "Valkey hasn't started within 120s." >&2
+exit 1

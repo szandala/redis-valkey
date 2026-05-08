@@ -1,0 +1,104 @@
+#!/bin/bash -eu
+# Bootstrap for the RIOT migrator VM. Installs RIOT 4.3.0 standalone (bundles
+# its own JRE), then writes a systemd template unit that runs one RIOT process
+# per database. In cluster mode there is only DB 0, so you enable exactly one
+# instance, but the template is reusable for future standalone migrations.
+#
+# We deliberately bind the service to IPs, not DNS. The service DNS record
+# (cache.*) gets swapped during cutover; if RIOT resolved that name, it would
+# end up replicating Valkey to itself. Hardcoding IPs at bootstrap time makes
+# RIOT immune to any DNS changes or failures.
+
+RIOT_VERSION="4.3.0"
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update
+apt-get install -y unzip wget ca-certificates redis-tools
+
+
+# The standalone zip bundles a JRE. No separate openjdk install needed
+cd /opt
+wget "https://github.com/redis/riot/releases/download/v$${RIOT_VERSION}/riot-standalone-$${RIOT_VERSION}-linux-x86_64.zip"
+unzip -q "riot-standalone-$${RIOT_VERSION}-linux-x86_64.zip"
+mv "riot-standalone-$${RIOT_VERSION}-linux-x86_64" riot
+rm "riot-standalone-$${RIOT_VERSION}-linux-x86_64.zip"
+
+echo 'export PATH=$PATH:/opt/riot/bin' > /etc/profile.d/riot.sh
+
+# Forward replication unit: Redis -> Valkey
+cat > /etc/systemd/system/riot-replicate.service <<'EOF'
+[Unit]
+Description=RIOT replicate Redis -> Valkey
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/riot-replicate
+ExecStart=/opt/riot/bin/riot replicate \
+  ${REDIS_PASS}@${SOURCE_REDIS}  \
+  ${VALKEY_PASS}@${TARGET_VALKEY} \
+  --source-cluster --target-cluster \
+  --mode live \
+  --type struct \
+  --event-queue 500000 \
+  --idle-timeout 300000 \
+  --threads 8 --batch 250 --read-batch 500 --read-queue 10000 \
+  --info
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=riot-replicate
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Reverse direction: Valkey -> Redis. Runs for the 24-48h rollback window
+# after cutover. Same environment file, source and target swapped.
+cat > /etc/systemd/system/riot-replicate-reverse.service <<'EOF'
+[Unit]
+Description=RIOT replicate Valkey -> Redis
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/riot-replicate
+ExecStart=/opt/riot/bin/riot replicate \
+  ${VALKEY_PASS}@${TARGET_VALKEY} \
+  ${REDIS_PASS}@${SOURCE_REDIS}  \
+  --source-cluster --target-cluster \
+  --mode live \
+  --type struct \
+  --event-queue 500000 \
+  --idle-timeout 300000 \
+  --threads 8 --batch 250 --read-batch 500 --read-queue 10000 \
+  --info
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=riot-replicate-reverse
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+
+# Deliberately NOT enabling on boot. Migration is a deliberate act. Start the
+# service when ready, not whenever the VM reboots.
+#
+#   systemctl start  riot-replicate.service       # forward run
+#   journalctl -fu   riot-replicate.service       # follow logs
+#   systemctl start  riot-replicate-reverse.service  # after cutover
+
+echo "RIOT $${RIOT_VERSION} installed."
+echo "Source : ${SOURCE_REDIS}"
+echo "Target : ${TARGET_VALKEY}"
+echo "Start  : systemctl start riot-replicate.service"
+echo "Follow : journalctl -fu riot-replicate.service"

@@ -1,0 +1,93 @@
+#!/bin/bash -eu
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update
+apt-get install -y lsb-release curl gpg ca-certificates
+
+curl -fsSL https://packages.redis.io/gpg \
+  | gpg --dearmor -o /usr/share/keyrings/redis-archive-keyring.gpg
+
+echo "deb [signed-by=/usr/share/keyrings/redis-archive-keyring.gpg] https://packages.redis.io/deb $(lsb_release -cs) main" \
+  > /etc/apt/sources.list.d/redis.list
+
+apt-get update
+apt-get install -y redis-server=6:7.4.* redis-tools=6:7.4.*
+
+systemctl stop redis-server || true
+
+# Need for  cluster-announce-ip
+INSTANCE_IP=$(curl -sH "Metadata-Flavor: Google" \
+  http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip)
+
+install -d -o redis -g redis -m 0750 /var/lib/redis /var/log/redis
+
+cat > /etc/redis/redis.conf <<EOF
+# do not change or ask SRE
+
+bind 0.0.0.0 -::1
+port 6379
+protected-mode yes
+requirepass ${REDIS_PASS}
+masterauth ${REDIS_PASS}
+
+# Cluster
+cluster-enabled yes
+cluster-config-file /var/lib/redis/nodes.conf
+cluster-node-timeout 15000
+cluster-announce-ip $INSTANCE_IP
+cluster-announce-port 6379
+cluster-announce-bus-port 16379
+cluster-announce-hostname ${DNS_NAME}
+cluster-preferred-endpoint-type hostname
+cluster-require-full-coverage no
+
+appendonly yes
+appendfilename "appendonly.aof"
+appendfsync everysec
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 256mb
+save 900 1
+save 300 10
+save 60 10000
+dir /var/lib/redis
+
+maxmemory 24gb
+maxmemory-policy allkeys-lru
+
+# needed for RIOT
+notify-keyspace-events KEA
+
+tcp-keepalive 60
+tcp-backlog 511
+timeout 0
+
+io-threads 4
+io-threads-do-reads yes
+
+logfile /var/log/redis/redis-server.log
+loglevel notice
+
+daemonize no
+supervised systemd
+pidfile /run/redis/redis-server.pid
+
+# uable for migration to identify bottlenecks
+slowlog-log-slower-than 10000
+slowlog-max-len 256
+EOF
+
+chown redis:redis /etc/redis/redis.conf
+chmod 0640 /etc/redis/redis.conf
+
+systemctl enable --now redis-server
+
+for i in {1..60}; do
+  if redis-cli -a "${REDIS_PASS}" --no-auth-warning PING 2>/dev/null | grep -q PONG; then
+    echo "Redis up."
+    exit 0
+  fi
+  sleep 2
+done
+
+echo "Redis failed within 120s." >&2
+exit 1
